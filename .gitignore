@@ -1,0 +1,28 @@
+# Pipeline outputs (large or regenerable)
+data/
+results/
+
+# Python build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
