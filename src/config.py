@@ -17,14 +17,19 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROC_DIR = DATA_DIR / "processed"
+AUX_DIR = DATA_DIR / "aux"
 
 RESULTS_DIR = ROOT / "results"
 FIG_DIR = RESULTS_DIR / "figures"
 MODEL_DIR = RESULTS_DIR / "models"
 METRIC_DIR = RESULTS_DIR / "metrics"
 
-for _d in (RAW_DIR, PROC_DIR, FIG_DIR, MODEL_DIR, METRIC_DIR):
+for _d in (RAW_DIR, PROC_DIR, AUX_DIR, FIG_DIR, MODEL_DIR, METRIC_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+# NCBI E-utilities etiquette (override with ENTREZ_EMAIL in the environment).
+ENTREZ_EMAIL = "phage-host-pipeline@user.local"
+ENTREZ_TOOL = "staph_phage_pipeline"
 
 # ---------------------------------------------------------------------------
 # Data source
@@ -56,16 +61,47 @@ MIN_GENOME_LEN = 5_000
 MAX_GENOME_LEN = 500_000
 EXCLUDE_HOST_VALUES = {"", "Unknown"}
 
-# Per-class budget. We use *all* qualifying Staphylococcus phages and sample a
-# matched number of non-Staphylococcus phages, stratified across host genera so
-# the model is not exposed to one dominant out-group.
-NEG_PER_GENUS_CAP = 80          # cap to encourage host diversity
-MIN_GENERA_PER_NEG = 12         # require at least this many distinct host genera
+# We use *all* qualifying Staphylococcus phages and a **matched-count** negative
+# set for training, but negatives are quota-sampled across phylogenetic strata
+# (NCBI lineage distance to Staphylococcus) so the classifier is not dominated
+# by the most phylogenetically distant out-groups.
+NEG_PER_GENUS_CAP = 80          # per-genus cap within each stratum
+MIN_GENERA_PER_NEG = 12         # unique genera required in final negative set
+
+# Target fraction of negatives drawn from each tertile bucket (near | mid | far
+# defined from intra-negative distance quantiles). Residual mass is allocated
+# to ``far`` if a stratum is exhausted.
+NEG_STRATUM_FRACTIONS = {"near": 0.32, "mid": 0.32, "far": 0.32, "unresolved": 0.04}
 
 # ---------------------------------------------------------------------------
 # Features
 # ---------------------------------------------------------------------------
 KMER_SIZES = (2, 3, 4)
+
+# ---------------------------------------------------------------------------
+# Evaluation: prevalence scenarios + screening threshold
+# ---------------------------------------------------------------------------
+# Artificial prevalence grid for deployment-style reporting (fraction positive).
+PREVALENCE_GRID = (0.01, 0.02, 0.05, 0.10, 0.50)
+
+# Tuning prevalence for recall-target threshold selection: use empirical INPHARED
+# Staphylococcus / all filtered phages (written to ``corpus_stats.json``).
+# Default when stats file missing:
+CALIBRATION_PREVALENCE_FLOOR = 0.02
+
+# OOF recall target for the primary screening operating point (primary model).
+TARGET_RECALL_OOF = 0.95
+
+# Cluster bootstrap resamples for 95% confidence intervals on held-out metrics.
+# Override at train time with ``python -m src.train_models --bootstrap-draws N``.
+BOOTSTRAP_CLUSTER_DRAWS = 2000
+
+# When a target prevalence π needs more held-out negatives than exist, we draw
+# negatives **with replacement** this many times and report mean ± std of metrics.
+PREVALENCE_MONTE_CARLO_NEGATIVE_DRAWS = 512
+
+# Optional multi-seed robustness (``python -m src.train_models --seed N``).
+ROBUSTNESS_SEEDS = tuple(range(42, 47))  # 42–46 inclusive
 
 # ---------------------------------------------------------------------------
 # Leakage control

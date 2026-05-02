@@ -10,10 +10,10 @@ Features per genome
 * ``length_log10``                 - log10 of genome length in bp
 * ``gc_content``, ``gc_skew``,
   ``at_skew``                      - global compositional features
-* canonical k-mer frequencies for
-  ``k = 2, 3, 4``                  - 10 + 32 + 136 = 178 features
+* canonical k-mer frequencies for ``k = 2, 3, 4`` (178 dimensions)
+  plus **dinucleotide odds ratios** ρ (10 dims, aligned with canonical 2-mers)
 
-Canonical k-mers collapse a k-mer and its reverse complement to a single
+Non-ACGT characters
 feature, which is the right normalisation for double-stranded DNA where the
 strand orientation of the assembly is arbitrary. Non-ACGT characters
 (``N``, ``R``, ``Y``, ...) reset the k-mer window so that ambiguous bases
@@ -71,8 +71,54 @@ def _build_canonical_index(k: int) -> tuple[np.ndarray, int]:
     return compact, len(unique_canonical)
 
 
-# Pre-compute lookup tables once at import time.
 _CANONICAL = {k: _build_canonical_index(k) for k in config.KMER_SIZES}
+
+
+# Pre-compute canonical k-mer representative strings once per ``k``.
+def _canonical_reps_ordered(k: int) -> list[str]:
+    bases = "ACGT"
+    compact_map, n_canonical = _CANONICAL[k]
+    seen: dict[int, str] = {}
+    for idx in range(4 ** k):
+        cid = int(compact_map[idx])
+        if cid in seen:
+            continue
+        kmer_chars = []
+        v = idx
+        for _ in range(k):
+            kmer_chars.append(bases[v & 0b11])
+            v >>= 2
+        seen[cid] = "".join(reversed(kmer_chars))
+    return [seen[i] for i in range(n_canonical)]
+
+
+_REPS_K2 = _canonical_reps_ordered(2)
+
+
+def _mononucleotide_probs(seq_codes: np.ndarray) -> np.ndarray:
+    valid = seq_codes >= 0
+    if not np.any(valid):
+        return np.full(4, 0.25, dtype=np.float64)
+    cnt = np.array([int(np.sum(seq_codes[valid] == b)) for b in range(4)], dtype=np.float64)
+    tot = cnt.sum()
+    if tot <= 0:
+        return np.full(4, 0.25, dtype=np.float64)
+    return cnt / tot
+
+
+def _dinucleotide_odds_ratios(obs2: np.ndarray, probs: np.ndarray) -> np.ndarray:
+    """ρ for each *canonical* dinucleotide (symmetrised under RC).
+
+    ``expected`` pools the forward dinucleotide ``XY`` and its reverse complement
+    ``(comp(Y) comp(X))`` under mononucleotide independence.
+    """
+    out = np.empty(len(_REPS_K2), dtype=np.float32)
+    for i, s in enumerate(_REPS_K2):
+        xa = "ACGT".index(s[0])
+        xb = "ACGT".index(s[1])
+        exp_bidir = probs[xa] * probs[xb] + probs[3 - xb] * probs[3 - xa]
+        out[i] = float(obs2[i] / (exp_bidir + 1e-12))
+    return out
 
 
 def _kmer_frequencies(seq_codes: np.ndarray, k: int) -> np.ndarray:
@@ -195,22 +241,9 @@ def _iter_fasta(paths: list[Path]) -> Iterator[tuple[str, np.ndarray]]:
 
 def _feature_names() -> list[str]:
     names = ["length_log10", "gc_content", "gc_skew", "at_skew"]
-    bases = "ACGT"
     for k in config.KMER_SIZES:
-        compact_map, _ = _CANONICAL[k]
-        # Recover one representative k-mer string per canonical class.
-        seen: dict[int, str] = {}
-        for idx in range(4 ** k):
-            cid = int(compact_map[idx])
-            if cid in seen:
-                continue
-            kmer_chars = []
-            v = idx
-            for _ in range(k):
-                kmer_chars.append(bases[v & 0b11])
-                v >>= 2
-            seen[cid] = "".join(reversed(kmer_chars))
-        names.extend([f"kmer{k}_{seen[i]}" for i in range(len(seen))])
+        names.extend([f"kmer{k}_{rep}" for rep in _canonical_reps_ordered(k)])
+    names.extend([f"dioratio2_{rep}" for rep in _REPS_K2])
     return names
 
 
@@ -238,10 +271,17 @@ def build(manifest_path: Path | None = None) -> Path:
         feats[2] = gc_skew
         feats[3] = at_skew
         offset = 4
+        k2freq = None
         for k in config.KMER_SIZES:
             kfreq = _kmer_frequencies_fast(codes, k)
             feats[offset : offset + len(kfreq)] = kfreq
+            if k == 2:
+                k2freq = kfreq
             offset += len(kfreq)
+        probs = _mononucleotide_probs(codes)
+        assert k2freq is not None
+        dior = _dinucleotide_odds_ratios(k2freq, probs)
+        feats[offset : offset + len(dior)] = dior
         found[acc] = feats
         pbar.update(1)
         if len(found) == len(wanted):
@@ -258,15 +298,19 @@ def build(manifest_path: Path | None = None) -> Path:
     X = np.stack([found[a] for a in manifest["accession"].astype(str).tolist()])
     y = manifest["label"].to_numpy().astype(np.int8)
 
+    save_opts: dict = {
+        "X": X,
+        "y": y,
+        "feature_names": np.array(feature_names),
+        "accession": manifest["accession"].astype(str).to_numpy(),
+        "host": manifest["host"].astype(str).to_numpy(),
+    }
+    for col in ("tax_distance", "tax_stratum", "tax_resolution"):
+        if col in manifest.columns:
+            save_opts[col] = manifest[col].to_numpy()
+
     out_npz = config.PROC_DIR / "features.npz"
-    np.savez_compressed(
-        out_npz,
-        X=X,
-        y=y,
-        feature_names=np.array(feature_names),
-        accession=manifest["accession"].astype(str).to_numpy(),
-        host=manifest["host"].astype(str).to_numpy(),
-    )
+    np.savez_compressed(out_npz, **save_opts)
     out_manifest = config.PROC_DIR / "manifest_with_features.csv"
     manifest.to_csv(out_manifest, index=False)
 

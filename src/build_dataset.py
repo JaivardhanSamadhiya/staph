@@ -1,90 +1,40 @@
-"""Filter the INPHARED metadata and assemble a balanced labelled corpus.
+"""Filter the INPHARED metadata and assemble a labelled corpus.
 
-The INPHARED ``data.tsv.gz`` has no header row; columns follow a fixed layout
-documented in the INPHARED README. We use the columns relevant to dataset
-construction:
+Negatives are quota-sampled across *phylogenetic distance tertiles* (NCBI
+Taxonomy lineage) relative to genus *Staphylococcus*, so the classifier sees
+near-neighbour hosts (e.g. other Firmicutes) as well as more distant phyla.
 
-* 0 - GenBank accession
-* 3 - phage description (organism)
-* 4 - genome length (bp)
-* 5 - GC fraction
-* 11 - viral family (Caudoviricetes etc.)
-* 12 - viral subfamily
-* 13 - viral genus
-* 14 - lifestyle prediction (Virulent / Temperate / Unknown)
-* 15 - completeness flag
-* 16 - completeness percentage
-* 17 - host genus parsed from organism name
-* 18 - host genus parsed from /host or /lab_host GenBank tags
-
-We treat *Staphylococcus* phages as the positive class and assemble a host-
-diverse, host-balanced negative class from the remaining genera. We also apply
-length and completeness filters so the model is not learning artefacts of
-draft assemblies.
+Host names are resolved against NCBI with a fallback chain (exact → first
+token → unresolved); see ``taxonomy.py`` and the strata summary CSV for counts.
 """
 
 from __future__ import annotations
 
 import argparse
 import gzip
+import json
 
 import numpy as np
 import pandas as pd
 
-from . import config
+from . import config, taxonomy
 from .utils import get_logger
 
 log = get_logger("build_dataset")
 
-# Column indices documented above
-COL_ACCESSION = 0
-COL_DESCRIPTION = 3
-COL_LENGTH = 4
-COL_GC = 5
-COL_FAMILY = 11
-COL_SUBFAMILY = 12
-COL_GENUS = 13
-COL_LIFESTYLE = 14
-COL_COMPLETE_FLAG = 15
-COL_COMPLETE_PCT = 16
-COL_HOST_TAX = 17
-COL_HOST_LAB = 18
-
 COLUMNS = [
-    "accession",     # 0
-    "release_date",  # 1
-    "molecule",      # 2
-    "description",   # 3
-    "length",        # 4
-    "gc",            # 5
-    "realm",         # 6
-    "kingdom",       # 7
-    "phylum",        # 8
-    "class",         # 9
-    "order",         # 10
-    "family",        # 11
-    "subfamily",     # 12
-    "viral_genus",   # 13
-    "lifestyle",     # 14
-    "complete",      # 15
-    "complete_pct",  # 16
-    "host_tax",      # 17
-    "host_lab",      # 18
+    "accession", "release_date", "molecule", "description", "length", "gc",
+    "realm", "kingdom", "phylum", "class", "order", "family", "subfamily",
+    "viral_genus", "lifestyle", "complete", "complete_pct", "host_tax", "host_lab",
 ]
 
 
 def load_metadata(path=config.META_PATH) -> pd.DataFrame:
-    """Read the gzipped TSV into a DataFrame with our column names."""
     log.info("Reading INPHARED metadata from %s", path)
     with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
         df = pd.read_csv(
-            fh,
-            sep="\t",
-            header=None,
-            names=COLUMNS,
-            dtype=str,
-            na_values=[""],
-            keep_default_na=False,
+            fh, sep="\t", header=None, names=COLUMNS, dtype=str,
+            na_values=[""], keep_default_na=False,
         )
     df["length"] = pd.to_numeric(df["length"], errors="coerce")
     df["gc"] = pd.to_numeric(df["gc"], errors="coerce")
@@ -100,11 +50,6 @@ def _quality_filter(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["length"].between(config.MIN_GENOME_LEN, config.MAX_GENOME_LEN)]
     df = df[~df["host_tax"].isin(config.EXCLUDE_HOST_VALUES)]
 
-    # Reject entries where the canonical phage organism name does not begin
-    # with the asserted bacterial host genus.  This removes records where the
-    # ``host_tax`` column has been populated from a sample-source organism
-    # (e.g. lemur or human gut metagenomes) rather than the bacterial host
-    # the phage actually infects.
     first_word = df["description"].str.split(" ").str[0].str.lower()
     df = df[first_word == df["host_tax"].str.lower()].copy()
 
@@ -113,79 +58,210 @@ def _quality_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _resolve_host(row: pd.Series) -> str:
-    """Use the curated host genus parsed from the phage organism name.
-
-    INPHARED also exposes a ``host_lab`` column built from the GenBank
-    ``/host`` and ``/lab_host`` qualifiers.  That column is much noisier (it
-    sometimes contains the organism the sample was collected *from*, e.g.
-    primate genera for phages isolated from gut metagenomes), so we
-    deliberately do not fall back to it here.
-    """
     h = (row["host_tax"] or "").strip()
     if h and h not in config.EXCLUDE_HOST_VALUES:
         return h
     return ""
 
 
-def build(seed: int = config.SEED) -> pd.DataFrame:
-    """Construct the balanced manifest CSV used for downstream steps."""
+def _taxonomy_table_for_genera(uniq_genera: list[str]) -> pd.DataFrame:
+    """Resolve every unique negative host genus once; persiste NCBI cache."""
+    cache = taxonomy.load_cache()
+    rows = []
+    distances: list[float] = []
+    for g in uniq_genera:
+        res = taxonomy.resolve_genus(str(g), cache)
+        d = float(res.distance_to_staph)
+        if d == d:
+            distances.append(d)
+        rows.append({
+            "host_genus": str(g),
+            "tax_id": res.tax_id,
+            "resolution_method": res.resolution,
+            "scientific_rank": res.scientific_name_rank,
+            "distance_to_staphylococcus": d if d == d else np.nan,
+            "query_used": res.query_used,
+        })
+    taxonomy.save_cache(cache)
+    genus_df = pd.DataFrame(rows)
+
+    if len(distances) >= 3:
+        q1, q2 = np.quantile(distances, (1.0 / 3.0, 2.0 / 3.0))
+    else:
+        q1, q2 = (float("nan"), float("nan"))
+
+    def label_row(dval: float) -> str:
+        return taxonomy.strata_label_from_quantiles(float(dval), float(q1), float(q2))
+
+    genus_df["taxonomy_stratum"] = genus_df["distance_to_staphylococcus"].apply(label_row)
+    return genus_df, float(q1), float(q2)
+
+
+def _merge_tax_columns(neg_pool: pd.DataFrame, genus_df: pd.DataFrame) -> pd.DataFrame:
+    lk = genus_df.set_index("host_genus")
+    def dist(h: str) -> float:
+        return float(lk.loc[str(h), "distance_to_staphylococcus"])
+    def stratum(h: str) -> str:
+        return str(lk.loc[str(h), "taxonomy_stratum"])
+    def resolv(h: str) -> str:
+        return str(lk.loc[str(h), "resolution_method"])
+    out = neg_pool.copy()
+    out["tax_distance"] = out["host"].astype(str).apply(dist)
+    out["tax_stratum"] = out["host"].astype(str).apply(stratum)
+    out["tax_resolution"] = out["host"].astype(str).apply(resolv)
+    return out
+
+
+def _sample_stratified_negatives(
+    neg: pd.DataFrame, target_neg: int, seed: int,
+) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
+
+    frac = config.NEG_STRATUM_FRACTIONS
+    strata = ["near", "mid", "far", "unresolved"]
+    raw = [int(round(target_neg * frac[s])) for s in strata]
+    diff = target_neg - sum(raw)
+    raw[strata.index("far")] += diff
+
+    picked_idx: list[int] = []
+
+    def take_from(stratum_label: str, quota: int) -> None:
+        sub = neg.loc[neg["tax_stratum"] == stratum_label]
+        if sub.empty:
+            log.warning("No negatives in stratum %s", stratum_label)
+            return
+        grp = sub.groupby("host")
+        gens = list(grp.groups.keys())
+        rng.shuffle(gens)
+        counts = {g: 0 for g in gens}
+        chosen = 0
+        rounds = 0
+        max_rounds = quota * 15 + 400
+        picked_set = set(picked_idx)
+
+        while chosen < quota and rounds < max_rounds:
+            moved = False
+            for g in gens:
+                if chosen >= quota:
+                    break
+                if counts[g] >= config.NEG_PER_GENUS_CAP:
+                    continue
+                cand = grp.get_group(g)
+                avail = [int(i) for i in cand.index.to_list()]
+                rng.shuffle(avail)
+                for ix in avail:
+                    if ix not in picked_set:
+                        picked_idx.append(ix)
+                        picked_set.add(ix)
+                        counts[g] += 1
+                        chosen += 1
+                        moved = True
+                        break
+            if not moved:
+                break
+            rounds += 1
+
+    for s, q in zip(strata, raw):
+        take_from(s, q)
+
+    picked_set = set(picked_idx)
+    if len(picked_idx) < target_neg:
+        leftover = [int(i) for i in neg.index if int(i) not in picked_set]
+        rng.shuffle(leftover)
+        need = target_neg - len(picked_idx)
+        for ix in leftover[:need]:
+            picked_idx.append(ix)
+
+    out = neg.loc[picked_idx].drop_duplicates()
+    if len(out) > target_neg:
+        out = out.iloc[:target_neg]
+    elif len(out) < target_neg:
+        leftover = [int(i) for i in neg.index if int(i) not in set(out.index)]
+        rng.shuffle(leftover)
+        spill = neg.loc[leftover[: target_neg - len(out)]]
+        out = pd.concat([out, spill])
+
+    out = out.iloc[:target_neg]
+    out = out.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    out["label"] = 0
+    return out
+
+
+def build(seed: int = config.SEED) -> pd.DataFrame:
+
     df = load_metadata()
     df = _quality_filter(df)
     df["host"] = df.apply(_resolve_host, axis=1)
     df = df[~df["host"].isin(config.EXCLUDE_HOST_VALUES)].copy()
 
-    pos = df[df["host"].str.startswith(config.TARGET_HOST, na=False)].copy()
+    cor_pos = df["host"].astype(str).str.startswith(config.TARGET_HOST, na=False).sum()
+    corp_frac = float(cor_pos / len(df)) if len(df) else float("nan")
+    corpus_stats = {
+        "n_quality_filtered_phages": int(len(df)),
+        "n_staphylococcus_host": int(cor_pos),
+        "empirical_staphylococcus_fraction": corp_frac,
+    }
+    config.PROC_DIR.mkdir(parents=True, exist_ok=True)
+    with open(config.PROC_DIR / "corpus_stats.json", "w") as fh:
+        json.dump(corpus_stats, fh, indent=2)
+
+    pos = df[df["host"].astype(str).str.startswith(config.TARGET_HOST, na=False)].copy()
     pos["label"] = 1
-    log.info("Positives (%s phages): %d", config.TARGET_HOST, len(pos))
+    pos["tax_distance"] = 0.0
+    pos["tax_stratum"] = "target_genus"
+    pos["tax_resolution"] = "positive_genus"
 
-    neg_pool = df[~df["host"].str.startswith(config.TARGET_HOST, na=False)].copy()
-    log.info("Non-%s pool: %d", config.TARGET_HOST, len(neg_pool))
+    neg_pool = df[~df["host"].astype(str).str.startswith(config.TARGET_HOST, na=False)].copy()
+    neg_pool = neg_pool.reset_index(drop=True)
+    log.info("Non-%s pool: %d host genera (%d rows)",
+             config.TARGET_HOST, neg_pool["host"].nunique(), len(neg_pool))
 
-    # Stratified, host-balanced negative sampling. We cap the count per host
-    # genus and draw without replacement until the negative count matches the
-    # positive count.
+    uniq_genera = sorted(neg_pool["host"].astype(str).unique())
+    genus_df, q1, q2 = _taxonomy_table_for_genera(uniq_genera)
+    genus_df.to_csv(config.PROC_DIR / "taxonomy_genera.csv", index=False)
+
+    unresolved_n = int((genus_df["resolution_method"] == "unresolved").sum())
+    strata_counts = genus_df.groupby("taxonomy_stratum").size()
+
+    strata_summary = pd.DataFrame({
+        "metric": list(strata_counts.index) + [
+            "unique_genera_total", "unique_genera_unresolved",
+            "neg_pool_rows", "distance_tertile_q1", "distance_tertile_q2",
+            "empirical_staphylococcus_fraction_corpus",
+        ],
+        "value": list(strata_counts.values) + [
+            len(genus_df), unresolved_n, len(neg_pool),
+            q1, q2, corp_frac,
+        ],
+    })
+    strata_summary.to_csv(config.PROC_DIR / "taxonomy_strata_summary.csv", index=False)
+
+    neg_pool_t = _merge_tax_columns(neg_pool, genus_df)
     target_neg = len(pos)
-    chosen_idx: list[int] = []
-    grouped = neg_pool.groupby("host", sort=False)
-    # Shuffle group order for fairness across runs.
-    group_order = list(grouped.groups.keys())
-    rng.shuffle(group_order)
+    neg = _sample_stratified_negatives(neg_pool_t, target_neg, seed)
 
-    # First pass: take up to NEG_PER_GENUS_CAP from each genus.
-    for host_name in group_order:
-        idx = grouped.groups[host_name].to_list()
-        rng.shuffle(idx)
-        chosen_idx.extend(idx[: config.NEG_PER_GENUS_CAP])
-        if len(chosen_idx) >= target_neg * 2:
-            break
-
-    chosen_idx = list(dict.fromkeys(chosen_idx))  # de-dupe, preserve order
-    rng.shuffle(chosen_idx)
-    chosen_idx = chosen_idx[:target_neg]
-    neg = neg_pool.loc[chosen_idx].copy()
-    neg["label"] = 0
-
-    n_genera = neg["host"].nunique()
-    if n_genera < config.MIN_GENERA_PER_NEG:
+    if neg["host"].nunique() < config.MIN_GENERA_PER_NEG:
         raise RuntimeError(
-            f"Negative set has only {n_genera} host genera "
-            f"(< {config.MIN_GENERA_PER_NEG}); check filters."
+            f"Negative genera diversity too low ({neg['host'].nunique()} < "
+            f"{config.MIN_GENERA_PER_NEG}); adjust caps / filters."
         )
-    log.info("Negatives: %d phages across %d host genera", len(neg), n_genera)
 
     keep_cols = [
         "accession", "description", "length", "gc",
         "family", "subfamily", "viral_genus",
         "lifestyle", "host", "label",
+        "tax_distance", "tax_stratum", "tax_resolution",
     ]
     manifest = pd.concat([pos[keep_cols], neg[keep_cols]], ignore_index=True)
     manifest = manifest.sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
-    out = config.PROC_DIR / "manifest.csv"
-    manifest.to_csv(out, index=False)
-    log.info("Wrote manifest to %s (%d rows)", out, len(manifest))
-
+    out_path = config.PROC_DIR / "manifest.csv"
+    manifest.to_csv(out_path, index=False)
+    log.info(
+        "Wrote manifest to %s (%d rows); unresolved genera=%d; neg strata counts: %s",
+        out_path, len(manifest), unresolved_n,
+        neg.groupby("tax_stratum").size().to_dict(),
+    )
     return manifest
 
 
