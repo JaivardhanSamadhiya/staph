@@ -89,6 +89,21 @@ def _metrics_by_model(blob: dict) -> dict:
     return {k: v for k, v in blob.items() if k in MODEL_ORDER}
 
 
+def _default_threshold_metrics(model_entry: dict) -> dict:
+    """Flatten block for metrics at θ=0.5 (nested schema vs legacy flat)."""
+    blk = model_entry.get("threshold_default_0.5")
+    if isinstance(blk, dict):
+        return blk
+    return model_entry
+
+
+def _recall_target_metrics(model_entry: dict) -> dict | None:
+    """Block for OOF recall-target threshold, if present."""
+    key = f"threshold_recall_{float(config.TARGET_RECALL_OOF):.2f}"
+    blk = model_entry.get(key)
+    return blk if isinstance(blk, dict) else None
+
+
 def _load_cv_results() -> pd.DataFrame:
     return pd.read_csv(config.METRIC_DIR / "cv_results.csv")
 
@@ -306,7 +321,10 @@ def fig_roc_pr_stratum_near(preds: dict, test_blob: dict) -> None:
     mm = _metrics_by_model(test_blob)
     primary = test_blob.get("primary_model")
     if primary is None:
-        primary = max(mm, key=lambda m: mm[m]["threshold_default_0.5"]["roc_auc"])
+        primary = max(
+            mm,
+            key=lambda m: float(_default_threshold_metrics(mm[m]).get("roc_auc", float("nan"))),
+        )
 
     ts_raw = preds.get("tax_stratum")
     if ts_raw is None:
@@ -447,7 +465,10 @@ def fig_confusion(preds: dict, test_blob: dict) -> str:
     recall_targets = test_blob.get("recall_targets", {})
     primary = test_blob.get("primary_model")
     if primary is None:
-        primary = max(mm, key=lambda m: mm[m]["threshold_default_0.5"]["roc_auc"])
+        primary = max(
+            mm,
+            key=lambda m: float(_default_threshold_metrics(mm[m]).get("roc_auc", float("nan"))),
+        )
 
     thr = float(recall_targets.get(primary, 0.5))
     y = preds["y"]
@@ -678,16 +699,16 @@ def write_summary_report(test_blob: dict, cv_df: pd.DataFrame,
 
     test_rows = []
     for name in MODEL_ORDER:
-        m0 = mm[name]["threshold_default_0.5"]
+        m0 = _default_threshold_metrics(mm[name])
         rt = float(recall_targets.get(name, 0.5))
-        m1 = mm[name][f"threshold_recall_{config.TARGET_RECALL_OOF:.2f}"]
+        m1 = _recall_target_metrics(mm[name])
         test_rows.append({
             "model": MODEL_LABELS[name],
-            "ROC AUC": round(m0["roc_auc"], 4),
-            "PR AUC": round(m0["pr_auc"], 4),
-            "F1 @0.5": round(m0["f1"], 4),
-            "F1 @θ": round(m1["f1"], 4),
-            "recall @θ": round(m1["recall"], 4),
+            "ROC AUC": round(float(m0.get("roc_auc", float("nan"))), 4),
+            "PR AUC": round(float(m0.get("pr_auc", float("nan"))), 4),
+            "F1 @0.5": round(float(m0.get("f1", float("nan"))), 4),
+            "F1 @θ": round(float(m1["f1"]), 4) if m1 else "—",
+            "recall @θ": round(float(m1["recall"]), 4) if m1 else "—",
             "θ (OOF target recall)": round(rt, 4),
         })
     lines.append(_df_to_markdown(pd.DataFrame(test_rows), index=False))

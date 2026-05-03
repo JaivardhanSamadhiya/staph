@@ -325,6 +325,13 @@ def _cv_metrics(
     return {"summary": summary, "fold_scores": scores, "oof": oof_predictions}
 
 
+def _oof_train_to_full(oof_tr: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
+    """Map training-row OOF probs (same order as ``X[train_mask]``) to full-corpus length."""
+    out = np.full(len(train_mask), np.nan, dtype=np.float64)
+    out[train_mask] = oof_tr
+    return out
+
+
 def _float_metric_slice(y_m: np.ndarray, p_m: np.ndarray, th: float) -> tuple[dict[str, float], dict[str, float]]:
     """Point metrics at default θ=0.5 and at recall-target θ for one mixture."""
     md = _binary_metrics(y_m, (p_m >= 0.5).astype(int), p_m)
@@ -542,9 +549,9 @@ def train(seed: int = config.SEED, bootstrap_draws: int | None = None) -> dict[s
         cv_summary[name] = result["summary"]
         oof = result["oof"]
         oof_predictions[name] = oof
-        tr_idx = np.flatnonzero(train_mask)
-        y_oof = y[tr_idx]
-        p_oof = oof[tr_idx]
+        # ``oof`` is indexed 0..len(X_tr)-1 (CV on the training split only), not global row ids.
+        y_oof = y_tr
+        p_oof = oof
         recall_thresholds[name] = _oof_recall_threshold(
             y_oof, p_oof, float(config.TARGET_RECALL_OOF),
         )
@@ -728,7 +735,8 @@ def train(seed: int = config.SEED, bootstrap_draws: int | None = None) -> dict[s
         feature_names=np.asarray(feature_names),
         recall_target_models=recall_models,
         recall_target_values=recall_vals,
-        **{f"oof_{n}": oof_predictions[n] for n in oof_predictions},
+        **{f"oof_{n}": _oof_train_to_full(oof_predictions[n], train_mask)
+           for n in oof_predictions},
         **{f"test_{n}": test_predictions[n] for n in test_predictions},
     )
 
